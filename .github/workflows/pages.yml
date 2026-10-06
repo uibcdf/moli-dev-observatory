@@ -1,0 +1,69 @@
+name: Publish Observatory
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 0,6,12,18 * * *"
+      timezone: "America/Mexico_City"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Test before publication
+        run: |
+          python -m compileall moli_dev_observatory
+          python -m unittest discover -s tests -v
+
+      - name: Build public Observatory
+        run: >-
+          python -m moli_dev_observatory
+          --output build/development-observatory
+          --days 90
+          --timezone America/Mexico_City
+
+      - name: Retain generated Observatory
+        uses: actions/upload-artifact@v4
+        with:
+          name: moli-development-observatory
+          path: build/development-observatory
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: build/development-observatory
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
