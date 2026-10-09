@@ -35,11 +35,17 @@ jobs:
           python -m unittest discover -s tests -v
 
       - name: Build public Observatory
-        run: >-
-          python -m moli_dev_observatory
-          --output build/development-observatory
-          --days 90
-          --timezone America/Mexico_City
+        env:
+          MOLI_OBSERVATORY_GITHUB_TOKEN: ${{ secrets.MOLI_OBSERVATORY_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$MOLI_OBSERVATORY_GITHUB_TOKEN" ]; then
+            echo "::warning::MOLI_OBSERVATORY_GITHUB_TOKEN is unset; collection will use the anonymous API limit."
+          fi
+          python -m moli_dev_observatory \
+            --output build/development-observatory \
+            --days 90 \
+            --timezone America/Mexico_City \
+            --public-only
 
       - name: Retain generated Observatory
         uses: actions/upload-artifact@v4

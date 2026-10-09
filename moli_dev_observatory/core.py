@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -62,6 +63,7 @@ class GitHubAPIError(RuntimeError):
         *,
         rate_limit_remaining: str | None = None,
         rate_limit_reset: str | None = None,
+        retry_after: str | None = None,
     ) -> None:
         super().__init__(f"GitHub API request failed ({status}) for {url}: {body}")
         self.status = status
@@ -69,10 +71,11 @@ class GitHubAPIError(RuntimeError):
         self.body = body
         self.rate_limit_remaining = rate_limit_remaining
         self.rate_limit_reset = rate_limit_reset
+        self.retry_after = retry_after
 
     @property
     def is_rate_limited(self) -> bool:
-        return self.rate_limit_remaining == "0" or "rate limit" in self.body.lower()
+        return self.status == 429 or self.rate_limit_remaining == "0" or "rate limit" in self.body.lower()
 
 
 def api_json(url: str, token: str | None) -> Any:
@@ -91,14 +94,37 @@ def api_json(url: str, token: str | None) -> Any:
             body,
             rate_limit_remaining=exc.headers.get("X-RateLimit-Remaining"),
             rate_limit_reset=exc.headers.get("X-RateLimit-Reset"),
+            retry_after=exc.headers.get("Retry-After"),
         ) from exc
+
+
+def api_json_with_retries(url: str, token: str | None) -> Any:
+    for attempt in range(3):
+        try:
+            return api_json(url, token)
+        except GitHubAPIError as exc:
+            if exc.status not in (403, 429) or not exc.is_rate_limited or attempt == 2:
+                raise
+            fallback = 60 * (2**attempt)
+            try:
+                if exc.retry_after is not None:
+                    delay = max(1.0, float(exc.retry_after))
+                elif exc.rate_limit_remaining == "0" and exc.rate_limit_reset:
+                    delay = max(1.0, int(exc.rate_limit_reset) - time.time() + 2)
+                else:
+                    delay = fallback
+            except ValueError:
+                delay = fallback
+            print(f"GitHub API rate limit reached; retrying in {delay:.0f} seconds.", flush=True)
+            time.sleep(delay)
+    raise AssertionError("Unreachable retry state")
 
 
 def repository_issues(repository: str, token: str | None) -> list[dict[str, Any]]:
     result, page = [], 1
     while True:
         query = urllib.parse.urlencode({"state": "all", "per_page": 100, "page": page, "sort": "created", "direction": "asc"})
-        payload = api_json(f"{GITHUB_API}/repos/{repository}/issues?{query}", token)
+        payload = api_json_with_retries(f"{GITHUB_API}/repos/{repository}/issues?{query}", token)
         if not isinstance(payload, list):
             raise RuntimeError(f"Unexpected issue payload for {repository}")
         result.extend(item for item in payload if "pull_request" not in item)
@@ -127,6 +153,7 @@ def collect(
     scope: list[dict[str, str]],
     token: str | None,
     *,
+    public_only: bool = False,
     moli_registry_source: str = "moli.toml",
     molsyssuite_registry_source: str = "uibcdf/molsyssuite:suite.toml",
 ) -> dict[str, Any]:
@@ -135,6 +162,16 @@ def collect(
     excluded_scope: list[dict[str, Any]] = []
     for entry in scope:
         try:
+            if public_only and token:
+                repository = entry["repository"]
+                metadata = api_json_with_retries(f"{GITHUB_API}/repos/{repository}", token)
+                if not isinstance(metadata, dict) or not isinstance(metadata.get("private"), bool):
+                    raise RuntimeError(f"Unexpected repository metadata for {repository}")
+                if metadata["private"]:
+                    excluded_scope.append(
+                        {**entry, "visibility": "private", "reason": "repository is not public"}
+                    )
+                    continue
             issues = repository_issues(entry["repository"], token)
         except GitHubAPIError as exc:
             if exc.status == 404:
@@ -146,7 +183,7 @@ def collect(
                     }
                 )
                 continue
-            if exc.status == 403 and exc.is_rate_limited:
+            if exc.status in (403, 429) and exc.is_rate_limited:
                 reset = (
                     datetime.fromtimestamp(int(exc.rate_limit_reset), UTC)
                     .replace(microsecond=0)
@@ -302,6 +339,11 @@ def main() -> int:
     )
     parser.add_argument("--days", type=int, default=90)
     parser.add_argument("--timezone", default="America/Mexico_City")
+    parser.add_argument(
+        "--public-only",
+        action="store_true",
+        help="Exclude private repositories even when the token can access them.",
+    )
     args = parser.parse_args()
     if args.days < 1:
         parser.error("--days must be >= 1")
@@ -324,6 +366,7 @@ def main() -> int:
     dataset = collect(
         requested_scope,
         os.environ.get("MOLI_OBSERVATORY_GITHUB_TOKEN") or None,
+        public_only=args.public_only,
         moli_registry_source=moli_source,
         molsyssuite_registry_source=suite_source,
     )

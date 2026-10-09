@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from moli_dev_observatory.core import (
     GitHubAPIError,
+    api_json_with_retries,
     collect,
     dashboard_html,
     discover_scope,
@@ -134,6 +135,58 @@ class ObservatoryTests(unittest.TestCase):
         result = metrics(dataset, days=1, timezone_name="UTC")
         self.assertEqual(result["summary"]["repositories"], 1)
         self.assertEqual(result["summary"]["excluded_repositories"], 1)
+
+    def test_rate_limit_retry_waits_until_reset(self):
+        error = GitHubAPIError(
+            403, "https://api.github.test/issues", "rate limit exceeded",
+            rate_limit_remaining="0", rate_limit_reset="1010",
+        )
+        with patch("moli_dev_observatory.core.api_json", side_effect=[error, []]) as request, patch(
+            "moli_dev_observatory.core.time.time", return_value=1000
+        ), patch("moli_dev_observatory.core.time.sleep") as sleep:
+            self.assertEqual(api_json_with_retries("https://api.github.test/issues", None), [])
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(12)
+
+    def test_rate_limit_retry_stops_after_three_attempts(self):
+        error = GitHubAPIError(
+            429, "https://api.github.test/issues", "slow down", retry_after="1"
+        )
+        with patch("moli_dev_observatory.core.api_json", side_effect=error) as request, patch(
+            "moli_dev_observatory.core.time.sleep"
+        ) as sleep:
+            with self.assertRaises(GitHubAPIError):
+                api_json_with_retries("https://api.github.test/issues", None)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_public_collection_excludes_private_repositories_before_reading_issues(self):
+        scope = [
+            {"repository": "uibcdf/public", "layer": "MOLI"},
+            {"repository": "uibcdf/private", "layer": "Infrastructure"},
+        ]
+
+        def fake_metadata(url, token):
+            self.assertEqual(token, "test-token")
+            return {"private": url.endswith("/private")}
+
+        with patch("moli_dev_observatory.core.api_json_with_retries", side_effect=fake_metadata), patch(
+            "moli_dev_observatory.core.repository_issues", return_value=[]
+        ) as issues:
+            dataset = collect(scope, "test-token", public_only=True)
+
+        self.assertEqual([item["repository"] for item in dataset["scope"]], ["uibcdf/public"])
+        self.assertEqual(dataset["excluded_scope"][0]["reason"], "repository is not public")
+        issues.assert_called_once_with("uibcdf/public", "test-token")
+
+    def test_public_collection_rejects_unknown_visibility(self):
+        scope = [{"repository": "uibcdf/unknown", "layer": "MOLI"}]
+        with patch("moli_dev_observatory.core.api_json_with_retries", return_value={}), patch(
+            "moli_dev_observatory.core.repository_issues"
+        ) as issues:
+            with self.assertRaisesRegex(RuntimeError, "Unexpected repository metadata"):
+                collect(scope, "test-token", public_only=True)
+        issues.assert_not_called()
 
     def test_collection_aborts_on_rate_limit_instead_of_excluding(self):
         scope = [

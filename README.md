@@ -30,9 +30,11 @@ The normalized records and metric semantics are independent of the HTML renderer
 
 The production Pages build is intentionally **public-data-only**.
 
-The scheduled workflow does not use a broad PAT or organization secret to read the observed repositories. Public GitHub resources are collected anonymously; registered repositories that are private or otherwise inaccessible are recorded as excluded and do not receive repository pages.
+The scheduled workflow reads the repository secret `MOLI_OBSERVATORY_GITHUB_TOKEN` when available. Use a narrowly scoped fine-grained token; the public build checks repository visibility before collecting issues so a newly registered private repository is excluded. Without the secret, collection remains anonymous. If an API rate limit is reached, collection waits for the reset time reported by GitHub and retries up to twice before failing.
 
 This prevents a future private repository from becoming public merely because it is registered in MOLI or MolSysSuite.
+
+Create `MOLI_OBSERVATORY_GITHUB_TOKEN` under this repository's **Settings → Secrets and variables → Actions**, not as an organization secret. A fine-grained token can use **Only select repositories** with just `uibcdf/moli-dev-observatory` selected and no additional repository permissions beyond automatic read-only Metadata access. Check the organization's personal access token policy before using it. The workflow can also build without this secret, subject to the anonymous API limit.
 
 ## Time reference and refresh cadence
 
